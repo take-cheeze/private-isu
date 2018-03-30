@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
+	// "os/exec"
 	"path"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"crypto/sha512"
 
 	"github.com/bradfitz/gomemcache/memcache"
 	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
@@ -72,6 +74,8 @@ type Comment struct {
 	User      User
 }
 
+var imageCache map[int]*Post = make(map[int]*Post, 1000)
+
 func init() {
 	memcacheClient := memcache.New("localhost:11211")
 	store = gsm.NewMemcacheStore(memcacheClient, "isucogram_", []byte("sendagaya"))
@@ -124,6 +128,7 @@ func escapeshellarg(arg string) string {
 }
 
 func digest(src string) string {
+	/*
 	// opensslのバージョンによっては (stdin)= というのがつくので取る
 	out, err := exec.Command("/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
 	if err != nil {
@@ -132,6 +137,10 @@ func digest(src string) string {
 	}
 
 	return strings.TrimSuffix(string(out), "\n")
+*/
+	h := sha512.New()
+	h.Write([]byte(src))
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func calculateSalt(accountName string) string {
@@ -148,6 +157,19 @@ func getSession(r *http.Request) *sessions.Session {
 	return session
 }
 
+var userCache = make(map[int]*User)
+
+func getUserById(id int) *User {
+	if user, ok := userCache[id]; ok {
+		return user
+	} else {
+		u := &User{}
+		db.Get(u, "SELECT * FROM `users` WHERE `id` = ?", id)
+		userCache[id] = u
+		return u
+	}
+}
+
 func getSessionUser(r *http.Request) User {
 	session := getSession(r)
 	uid, ok := session.Values["user_id"]
@@ -155,14 +177,7 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	u := User{}
-
-	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
-	if err != nil {
-		return User{}
-	}
-
-	return u
+	return *getUserById(int(uid.(int64)))
 }
 
 func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
@@ -198,10 +213,7 @@ func makePosts(results []Post, CSRFToken string, allComments bool) ([]Post, erro
 		}
 
 		for i := 0; i < len(comments); i++ {
-			uerr := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if uerr != nil {
-				return nil, uerr
-			}
+			comments[i].User = *getUserById(comments[i].UserID)
 		}
 
 		// reverse
@@ -211,10 +223,7 @@ func makePosts(results []Post, CSRFToken string, allComments bool) ([]Post, erro
 
 		p.Comments = comments
 
-		perr := db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if perr != nil {
-			return nil, perr
-		}
+		p.User = *getUserById(p.UserID)
 
 		p.CSRFToken = CSRFToken
 
@@ -272,6 +281,11 @@ func getInitialize(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+var loginTemplate = template.Must(template.ParseFiles(
+	getTemplPath("layout.html"),
+	getTemplPath("login.html")),
+)
+
 func getLogin(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
@@ -280,10 +294,7 @@ func getLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("login.html")),
-	).Execute(w, struct {
+	loginTemplate.Execute(w, struct {
 		Me    User
 		Flash string
 	}{me, getFlash(w, r, "notice")})
@@ -299,7 +310,7 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 
 	if u != nil {
 		session := getSession(r)
-		session.Values["user_id"] = u.ID
+		session.Values["user_id"] = int64(u.ID)
 		session.Values["csrf_token"] = secureRandomStr(16)
 		session.Save(r, w)
 
@@ -313,16 +324,18 @@ func postLogin(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+var registerTemplate = template.Must(template.ParseFiles(
+	getTemplPath("layout.html"),
+	getTemplPath("register.html")),
+)
+
 func getRegister(w http.ResponseWriter, r *http.Request) {
 	if isLogin(getSessionUser(r)) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("register.html")),
-	).Execute(w, struct {
+	registerTemplate.Execute(w, struct {
 		Me    User
 		Flash string
 	}{User{}, getFlash(w, r, "notice")})
@@ -372,7 +385,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		fmt.Println(lerr.Error())
 		return
 	}
-	session.Values["user_id"] = uid
+	session.Values["user_id"] = int64(uid)
 	session.Values["csrf_token"] = secureRandomStr(16)
 	session.Save(r, w)
 
@@ -387,6 +400,15 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 
 	http.Redirect(w, r, "/", http.StatusFound)
 }
+
+var indexTemplate = template.Must(template.New("layout.html").Funcs(template.FuncMap{
+	"imageURL": imageURL,
+}).ParseFiles(
+	getTemplPath("layout.html"),
+	getTemplPath("index.html"),
+	getTemplPath("posts.html"),
+	getTemplPath("post.html"),
+))
 
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
@@ -405,22 +427,22 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("index.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	indexTemplate.Execute(w, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
 		Flash     string
 	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
 }
+
+var getAccountTemplate = template.Must(template.New("layout.html").Funcs(template.FuncMap{
+	"imageURL": imageURL,
+}).ParseFiles(
+	getTemplPath("layout.html"),
+	getTemplPath("user.html"),
+	getTemplPath("posts.html"),
+	getTemplPath("post.html"),
+))
 
 func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 	user := User{}
@@ -488,16 +510,7 @@ func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("user.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	getAccountTemplate.Execute(w, struct {
 		Posts          []Post
 		User           User
 		PostCount      int
@@ -506,6 +519,13 @@ func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 		Me             User
 	}{posts, user, postCount, commentCount, commentedCount, me})
 }
+
+var getPostsTemplate = template.Must(template.New("posts.html").Funcs(template.FuncMap{
+	"imageURL": imageURL,
+}).ParseFiles(
+	getTemplPath("posts.html"),
+	getTemplPath("post.html"),
+))
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
 	m, parseErr := url.ParseQuery(r.URL.RawQuery)
@@ -543,15 +563,16 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, posts)
+	getPostsTemplate.Execute(w, posts)
 }
+
+var getPostsIDTemplate = template.Must(template.New("layout.html").Funcs(template.FuncMap{
+	"imageURL": imageURL,
+}).ParseFiles(
+	getTemplPath("layout.html"),
+	getTemplPath("post_id.html"),
+	getTemplPath("post.html"),
+))
 
 func getPostsID(c web.C, w http.ResponseWriter, r *http.Request) {
 	pid, err := strconv.Atoi(c.URLParams["id"])
@@ -561,7 +582,7 @@ func getPostsID(c web.C, w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	rerr := db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	rerr := db.Select(&results, "SELECT `id` , `user_id` , `body` , `mime` , `created_at` FROM `posts` WHERE `id` = ?", pid)
 	if rerr != nil {
 		fmt.Println(rerr)
 		return
@@ -582,15 +603,7 @@ func getPostsID(c web.C, w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("post_id.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	getPostsIDTemplate.Execute(w, struct {
 		Post Post
 		Me   User
 	}{p, me})
@@ -683,11 +696,27 @@ func getImage(c web.C, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	post := Post{}
-	derr := db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if derr != nil {
-		fmt.Println(derr.Error())
-		return
+	fname := fmt.Sprintf("/tmp/image.%d", pid)
+	post, ok := imageCache[pid]
+	if ok {
+
+	} else {
+		post = &Post{}
+		derr := db.Get(post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+		if derr != nil {
+			fmt.Println(derr.Error())
+			return
+		}
+		imageCache[pid] = post
+		f, err := os.Create(fname)
+		if err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+		defer f.Close()
+		_, err = f.Write(post.Imgdata)
+		if err != nil { fmt.Println(err.Error()) }
+		f.Close()
 	}
 
 	ext := c.URLParams["ext"]
@@ -696,6 +725,10 @@ func getImage(c web.C, w http.ResponseWriter, r *http.Request) {
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
 		w.Header().Set("Content-Type", post.Mime)
+		w.Header().Set("Content-Length", strconv.Itoa(len(post.Imgdata)))
+		http.ServeFile(w, r, fname)
+		return
+
 		_, err := w.Write(post.Imgdata)
 		if err != nil {
 			fmt.Println(err.Error())
@@ -730,6 +763,11 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
 
+var getAdminBannedTemplate = template.Must(template.ParseFiles(
+	getTemplPath("layout.html"),
+	getTemplPath("banned.html")),
+)
+
 func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 	if !isLogin(me) {
@@ -749,10 +787,7 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("banned.html")),
-	).Execute(w, struct {
+	getAdminBannedTemplate.Execute(w, struct {
 		Users     []User
 		Me        User
 		CSRFToken string
@@ -810,7 +845,7 @@ func main() {
 	}
 
 	dsn := fmt.Sprintf(
-		"%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=true&loc=Local",
+		"%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=true&loc=Local&compression=true",
 		user,
 		password,
 		host,
